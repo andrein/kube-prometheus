@@ -2,17 +2,24 @@ local krp = import './kube-rbac-proxy.libsonnet';
 
 local defaults = {
   local defaults = self,
-  name: 'node-exporter',
-  namespace: error 'must provide namespace',
-  version: error 'must provide version',
-  image: error 'must provide version',
-  kubeRbacProxyImage: error 'must provide kubeRbacProxyImage',
-  resources: {
+  // Convention: Top-level fields related to CRDs are public, other fields are hidden
+  // If there is no CRD for the component, everything is hidden in defaults.
+  name:: 'node-exporter',
+  namespace:: error 'must provide namespace',
+  version:: error 'must provide version',
+  image:: error 'must provide version',
+  kubeRbacProxyImage:: error 'must provide kubeRbacProxyImage',
+  resources:: {
     requests: { cpu: '102m', memory: '180Mi' },
     limits: { cpu: '250m', memory: '180Mi' },
   },
-  listenAddress: '127.0.0.1',
-  port: 9100,
+  listenAddress:: '127.0.0.1',
+  filesystemMountPointsExclude:: '^/(dev|proc|sys|run/k3s/containerd/.+|var/lib/docker/.+|var/lib/kubelet/pods/.+)($|/)',
+  // NOTE: ignore veth network interface associated with containers.
+  // OVN renames veth.* to <rand-hex>@if<X> where X is /sys/class/net/<if>/ifindex
+  // thus [a-z0-9] regex below
+  ignoredNetworkDevices:: '^(veth.*|[a-f0-9]{15})$',
+  port:: 9100,
   commonLabels:: {
     'app.kubernetes.io/name': defaults.name,
     'app.kubernetes.io/version': defaults.version,
@@ -24,12 +31,21 @@ local defaults = {
     for labelName in std.objectFields(defaults.commonLabels)
     if !std.setMember(labelName, ['app.kubernetes.io/version'])
   },
-  mixin: {
+  mixin:: {
     ruleLabels: {},
     _config: {
       nodeExporterSelector: 'job="' + defaults.name + '"',
-      fsSpaceFillingUpCriticalThreshold: 15,
-      diskDeviceSelector: 'device=~"mmcblk.p.+|nvme.+|rbd.+|sd.+|vd.+|xvd.+|dm-.+|dasd.+"',
+      // Adjust NodeFilesystemSpaceFillingUp warning and critical thresholds according to the following default kubelet
+      // GC values,
+      // imageGCLowThresholdPercent: 80
+      // imageGCHighThresholdPercent: 85
+      // GC kicks in when imageGCHighThresholdPercent is hit and attempts to free upto imageGCLowThresholdPercent.
+      // See https://kubernetes.io/docs/reference/config-api/kubelet-config.v1beta1/ for more details.
+      // Warn only after imageGCHighThresholdPercent is hit, but filesystem is not freed up for a prolonged duration.
+      fsSpaceFillingUpWarningThreshold: 15,
+      // Send critical alert only after (imageGCHighThresholdPercent + 5) is hit, but filesystem is not freed up for a prolonged duration.
+      fsSpaceFillingUpCriticalThreshold: 10,
+      diskDeviceSelector: 'device=~"(/dev/)?(mmcblk.p.+|nvme.+|rbd.+|sd.+|vd.+|xvd.+|dm-.+|dasd.+)"',
       runbookURLPattern: 'https://runbooks.prometheus-operator.dev/runbooks/node/%s',
     },
   },
@@ -42,6 +58,11 @@ function(params) {
   // Safety check
   assert std.isObject(ne._config.resources),
   assert std.isObject(ne._config.mixin._config),
+  _metadata:: {
+    name: ne._config.name,
+    namespace: ne._config.namespace,
+    labels: ne._config.commonLabels,
+  },
 
   mixin:: (import 'github.com/prometheus/node_exporter/docs/node-mixin/mixin.libsonnet') +
           (import 'github.com/kubernetes-monitoring/kubernetes-mixin/lib/add-runbook-links.libsonnet') {
@@ -51,10 +72,9 @@ function(params) {
   prometheusRule: {
     apiVersion: 'monitoring.coreos.com/v1',
     kind: 'PrometheusRule',
-    metadata: {
-      labels: ne._config.commonLabels + ne._config.mixin.ruleLabels,
+    metadata: ne._metadata {
+      labels+: ne._config.mixin.ruleLabels,
       name: ne._config.name + '-rules',
-      namespace: ne._config.namespace,
     },
     spec: {
       local r = if std.objectHasAll(ne.mixin, 'prometheusRules') then ne.mixin.prometheusRules.groups else [],
@@ -66,10 +86,7 @@ function(params) {
   clusterRoleBinding: {
     apiVersion: 'rbac.authorization.k8s.io/v1',
     kind: 'ClusterRoleBinding',
-    metadata: {
-      name: ne._config.name,
-      labels: ne._config.commonLabels,
-    },
+    metadata: ne._metadata,
     roleRef: {
       apiGroup: 'rbac.authorization.k8s.io',
       kind: 'ClusterRole',
@@ -85,10 +102,7 @@ function(params) {
   clusterRole: {
     apiVersion: 'rbac.authorization.k8s.io/v1',
     kind: 'ClusterRole',
-    metadata: {
-      name: ne._config.name,
-      labels: ne._config.commonLabels,
-    },
+    metadata: ne._metadata,
     rules: [
       {
         apiGroups: ['authentication.k8s.io'],
@@ -106,21 +120,14 @@ function(params) {
   serviceAccount: {
     apiVersion: 'v1',
     kind: 'ServiceAccount',
-    metadata: {
-      name: ne._config.name,
-      namespace: ne._config.namespace,
-      labels: ne._config.commonLabels,
-    },
+    metadata: ne._metadata,
+    automountServiceAccountToken: false,
   },
 
   service: {
     apiVersion: 'v1',
     kind: 'Service',
-    metadata: {
-      name: ne._config.name,
-      namespace: ne._config.namespace,
-      labels: ne._config.commonLabels,
-    },
+    metadata: ne._metadata,
     spec: {
       ports: [
         { name: 'https', targetPort: 'https', port: ne._config.port },
@@ -133,11 +140,7 @@ function(params) {
   serviceMonitor: {
     apiVersion: 'monitoring.coreos.com/v1',
     kind: 'ServiceMonitor',
-    metadata: {
-      name: ne._config.name,
-      namespace: ne._config.namespace,
-      labels: ne._config.commonLabels,
-    },
+    metadata: ne._metadata,
     spec: {
       jobLabel: 'app.kubernetes.io/name',
       selector: {
@@ -164,6 +167,32 @@ function(params) {
     },
   },
 
+  networkPolicy: {
+    apiVersion: 'networking.k8s.io/v1',
+    kind: 'NetworkPolicy',
+    metadata: ne.service.metadata,
+    spec: {
+      podSelector: {
+        matchLabels: ne._config.selectorLabels,
+      },
+      policyTypes: ['Egress', 'Ingress'],
+      egress: [{}],
+      ingress: [{
+        from: [{
+          podSelector: {
+            matchLabels: {
+              'app.kubernetes.io/name': 'prometheus',
+            },
+          },
+        }],
+        ports: std.map(function(o) {
+          port: o.port,
+          protocol: 'TCP',
+        }, ne.service.spec.ports),
+      }],
+    },
+  },
+
   daemonset:
     local nodeExporter = {
       name: ne._config.name,
@@ -174,18 +203,20 @@ function(params) {
         '--path.rootfs=/host/root',
         '--no-collector.wifi',
         '--no-collector.hwmon',
-        '--collector.filesystem.ignored-mount-points=^/(dev|proc|sys|var/lib/docker/.+|var/lib/kubelet/pods/.+)($|/)',
-        // NOTE: ignore veth network interface associated with containers.
-        // OVN renames veth.* to <rand-hex>@if<X> where X is /sys/class/net/<if>/ifindex
-        // thus [a-z0-9] regex below
-        '--collector.netclass.ignored-devices=^(veth.*|[a-f0-9]{15})$',
-        '--collector.netdev.device-exclude=^(veth.*|[a-f0-9]{15})$',
+        '--collector.filesystem.mount-points-exclude=' + ne._config.filesystemMountPointsExclude,
+        '--collector.netclass.ignored-devices=' + ne._config.ignoredNetworkDevices,
+        '--collector.netdev.device-exclude=' + ne._config.ignoredNetworkDevices,
       ],
       volumeMounts: [
         { name: 'sys', mountPath: '/host/sys', mountPropagation: 'HostToContainer', readOnly: true },
         { name: 'root', mountPath: '/host/root', mountPropagation: 'HostToContainer', readOnly: true },
       ],
       resources: ne._config.resources,
+      securityContext: {
+        allowPrivilegeEscalation: false,
+        readOnlyRootFilesystem: true,
+        capabilities: { drop: ['ALL'], add: ['SYS_TIME'] },
+      },
     };
 
     local kubeRbacProxy = krp({
@@ -201,6 +232,12 @@ function(params) {
       // used by the service is tied to the proxy container. We *could*
       // forgo declaring the host port, however it is important to declare
       // it so that the scheduler can decide if the pod is schedulable.
+      //
+      // Although hostPort might not seem necessary, kubernetes adds it anyway
+      // when running with 'hostNetwork'. We might as well make sure it works
+      // the way we want.
+      //
+      // See also: https://github.com/kubernetes/kubernetes/blob/1945829906546caf867992669a0bfa588edf8be6/pkg/apis/core/v1/defaults.go#L402-L411
       ports: [
         { name: 'https', containerPort: ne._config.port, hostPort: ne._config.port },
       ],
@@ -214,19 +251,22 @@ function(params) {
     {
       apiVersion: 'apps/v1',
       kind: 'DaemonSet',
-      metadata: {
-        name: ne._config.name,
-        namespace: ne._config.namespace,
-        labels: ne._config.commonLabels,
-      },
+      metadata: ne._metadata,
       spec: {
-        selector: { matchLabels: ne._config.selectorLabels },
+        selector: {
+          matchLabels: ne._config.selectorLabels,
+        },
         updateStrategy: {
           type: 'RollingUpdate',
           rollingUpdate: { maxUnavailable: '10%' },
         },
         template: {
-          metadata: { labels: ne._config.commonLabels },
+          metadata: {
+            annotations: {
+              'kubectl.kubernetes.io/default-container': nodeExporter.name,
+            },
+            labels: ne._config.commonLabels,
+          },
           spec: {
             nodeSelector: { 'kubernetes.io/os': 'linux' },
             tolerations: [{
@@ -237,7 +277,9 @@ function(params) {
               { name: 'sys', hostPath: { path: '/sys' } },
               { name: 'root', hostPath: { path: '/' } },
             ],
+            automountServiceAccountToken: true,
             serviceAccountName: ne._config.name,
+            priorityClassName: 'system-cluster-critical',
             securityContext: {
               runAsUser: 65534,
               runAsNonRoot: true,
@@ -248,6 +290,4 @@ function(params) {
         },
       },
     },
-
-
 }
